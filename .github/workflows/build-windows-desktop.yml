@@ -1,0 +1,148 @@
+# 在 GitHub Actions 上自动编译 Windows x64 桌面安装包（NSIS .exe）。
+#
+# 设计目标：推到 GitHub 后一次成功。要点：
+# - 依赖仓库自带镜像兜底与重试（scripts/bundle.mjs 内置 electron-builder 3 次重试 +
+#   心跳日志 + npmmirror 回退），工作流不重复造轮子、不设"无输出即杀"。
+# - ZCODE_SKIP_REMOTE_ASSETS=1：桌面包不需要 mock-cdn 远端资产（node/dist、
+#   server bundle 等跨平台下载），这是原 CI 逼近 1 小时上限的主因，跳过可大幅缩短并
+#   减少网络失败面。
+# - 原生模块不依赖工具链：Windows 上 node-pty 命中自带预编译产物即跳过编译；
+#   退一步 windows-latest 也预装 VS Build Tools。
+# - rg/ugrep 的 win32 归档随仓库分发，prepare:native-search 只解包 + sha256 校验。
+#
+# 可选签名：安装包默认未签名。需要代码签名时，在该 job 的 env 中取消注释
+# 并配置仓库 Secret：CSC_LINK（base64 证书）、CSC_KEY_PASSWORD（证书密码）。
+#
+# 产物命名受 ZCODE_ENV 影响：production -> ZCode-<version>-win-x64.exe；
+# 删掉 ZCODE_ENV 则变为 Preview 身份并带 _TEST 后缀。
+
+name: build-desktop-windows
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-desktop-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # 快速反馈：类型与 lint。与打包 job 并行，不阻塞它 —— 打包本身的 tsup 编译也会
+  # 拦截类型错误，这里负责给出更清晰、更早的错误归属。
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Lint
+        run: pnpm lint
+
+  # 核心 job：Windows 桌面安装包。
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    env:
+      HUSKY: "0" # CI 不需要 git hooks
+      ZCODE_ENV: production # 生产身份：产物名 ZCode-<version>-win-x64.exe
+      ZCODE_SKIP_REMOTE_ASSETS: "1" # 跳过 mock-cdn 远端资产准备（主要耗时与网络风险源）
+      # 代码签名（可选）：取消注释并配置 Secrets 后启用
+      # CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+      # CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+          cache: pnpm
+
+      # 缓存 electron-builder 已下载的 Electron 41 zip 与 winCodeSign/NSIS 工具，
+      # 避免每次冷跑重新下载约 120MB+ 且把瞬时网络故障放大成构建失败。
+      - name: Cache electron-builder downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.home }}/AppData/Local/electron-builder/Cache
+            ${{ runner.home }}/AppData/Local/electron/Cache
+          key: ${{ runner.os }}-electron-${{ hashFiles('packages/desktop/package.json', 'pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-electron-
+
+      # 缓存 turbo 构建产物（agent bundle 依赖 apps/zcode-cli 的多包 tsc 构建，
+      # 干净检出第一次很重），后续运行几乎瞬时。
+      - name: Cache turbo build outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/.turbo
+            ${{ github.workspace }}/node_modules/.cache/turbo
+          key: ${{ runner.os }}-turbo-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-turbo-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # 单条命令完成：prepare:runtime-assets（agent bundle + native-search）
+      # -> tsup/vite 生产构建 -> electron-builder（内置重试/心跳/镜像回退）
+      # -> app.asar 运行时闭包与 native 边界校验 -> 体积审计。
+      - name: Package Windows installer
+        run: pnpm bundle:desktop -- --os win --arch x64
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: zcode-windows-x64
+          path: packages/desktop/dist/*.exe
+          if-no-files-found: error
+
+      # electron-updater 差分更新元数据（exe 同目录的 latest.yml + .blockmap）。
+      - name: Upload update feed metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: zcode-windows-feed
+          path: |
+            packages/desktop/dist/latest.yml
+            packages/desktop/dist/*.blockmap
+          if-no-files-found: warn
+
+  # 打 v* 标签时把安装包挂到对应的 GitHub Release（draft，人工确认后再发布）。
+  release-on-tag:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-windows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: zcode-windows-x64
+          path: release
+      - name: Create draft GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release/*.exe \
+            --generate-notes --draft --title "$GITHUB_REF_NAME"
